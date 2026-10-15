@@ -686,7 +686,12 @@ func (s *service) processExits() {
 
 		for _, cp := range cps {
 			if ip, ok := cp.Process.(*process.Init); ok {
-				s.handleInitExit(e, cp.Container, ip)
+				// Run handleInitExit asynchronously so KillAll (which
+				// blocks waiting for a new `runc kill --all` process to
+				// be reaped) does not stall the processExits loop and
+				// fill s.ec, causing the reaper notify channel to deadlock.
+				// See https://github.com/containerd/containerd/issues/14292
+				go s.handleInitExit(e, cp.Container, ip)
 			} else {
 				s.handleProcessExit(e, cp.Container, cp.Process)
 			}
