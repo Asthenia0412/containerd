@@ -1801,3 +1801,284 @@ func TestResolveForbiddenGETFallbackNetworkError(t *testing.T) {
 		t.Errorf("expected 403 in error, got: %s", err.Error())
 	}
 }
+
+func TestBackoffDuration(t *testing.T) {
+	t.Run("429 with Retry-After seconds", func(t *testing.T) {
+		d := backoffDuration(http.StatusTooManyRequests, "10", 0)
+		assert.Equal(t, 10*time.Second, d, "Retry-After seconds should be respected exactly (before cap)")
+
+		d = backoffDuration(http.StatusTooManyRequests, "9000", 0)
+		assert.Equal(t, 60*time.Second, d, "Retry-After should be capped at 60s")
+	})
+
+	t.Run("429 with Retry-After HTTP-date", func(t *testing.T) {
+		future := time.Now().Add(5 * time.Second).UTC()
+		header := future.Format(http.TimeFormat)
+		d := backoffDuration(http.StatusTooManyRequests, header, 0)
+		assert.GreaterOrEqual(t, d, 4*time.Second, "should parse HTTP-date and return positive remaining time")
+		assert.LessOrEqual(t, d, 6*time.Second, "should be roughly 5s")
+	})
+
+	t.Run("429 without Retry-After exponential backoff", func(t *testing.T) {
+		// Use a fixed base check — jitter makes exact equality awkward.
+		d0 := backoffDuration(http.StatusTooManyRequests, "", 0)
+		assert.GreaterOrEqual(t, d0, 1*time.Second, "attempt 0: base 1s")
+		assert.LessOrEqual(t, d0, 1*time.Second+250*time.Millisecond, "attempt 0: base + 25%% jitter")
+
+		d1 := backoffDuration(http.StatusTooManyRequests, "", 1)
+		assert.GreaterOrEqual(t, d1, 2*time.Second, "attempt 1: base 2s")
+		assert.LessOrEqual(t, d1, 2*time.Second+500*time.Millisecond, "attempt 1: base + 25%% jitter")
+
+		d2 := backoffDuration(http.StatusTooManyRequests, "", 2)
+		assert.GreaterOrEqual(t, d2, 4*time.Second, "attempt 2: base 4s")
+		assert.LessOrEqual(t, d2, 4*time.Second+1*time.Second, "attempt 2: base + 25%% jitter")
+
+		d4 := backoffDuration(http.StatusTooManyRequests, "", 4)
+		assert.GreaterOrEqual(t, d4, 16*time.Second, "attempt 4: base 16s")
+
+		// Attempt beyond cap should still be capped.
+		d10 := backoffDuration(http.StatusTooManyRequests, "", 10)
+		assert.LessOrEqual(t, d10, 32*time.Second+8*time.Second, "should cap at 32s + 25%% jitter")
+	})
+
+	t.Run("other status codes get small delay", func(t *testing.T) {
+		d := backoffDuration(http.StatusServiceUnavailable, "", 0)
+		assert.Equal(t, 50*time.Millisecond, d)
+	})
+}
+
+func TestParseRetryAfterHeader(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		_, ok := parseRetryAfterHeader("")
+		assert.False(t, ok)
+	})
+
+	t.Run("seconds", func(t *testing.T) {
+		d, ok := parseRetryAfterHeader("42")
+		assert.True(t, ok)
+		assert.Equal(t, 42*time.Second, d)
+	})
+
+	t.Run("zero seconds", func(t *testing.T) {
+		d, ok := parseRetryAfterHeader("0")
+		assert.True(t, ok)
+		assert.Equal(t, time.Duration(0), d)
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		_, ok := parseRetryAfterHeader("not-a-number")
+		assert.False(t, ok)
+	})
+
+	t.Run("http-date RFC1123", func(t *testing.T) {
+		future := time.Now().Add(5 * time.Second).UTC()
+		d, ok := parseRetryAfterHeader(future.Format(http.TimeFormat))
+		assert.True(t, ok)
+		assert.GreaterOrEqual(t, d, 4*time.Second)
+	})
+
+	t.Run("past http-date returns zero", func(t *testing.T) {
+		past := time.Now().Add(-5 * time.Second).UTC()
+		d, ok := parseRetryAfterHeader(past.Format(http.TimeFormat))
+		assert.True(t, ok)
+		assert.Equal(t, time.Duration(0), d)
+	})
+}
+
+func TestSleepWithContext(t *testing.T) {
+	t.Run("full duration", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		start := time.Now()
+		err := sleepWithContext(ctx, 200*time.Millisecond)
+		assert.NoError(t, err)
+		elapsed := time.Since(start)
+		assert.GreaterOrEqual(t, elapsed, 150*time.Millisecond, "should sleep at least ~200ms")
+		assert.LessOrEqual(t, elapsed, 500*time.Millisecond, "should not sleep too long")
+	})
+
+	t.Run("context canceled early", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+		start := time.Now()
+		err := sleepWithContext(ctx, 5*time.Second)
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.Less(t, time.Since(start), 2*time.Second)
+	})
+
+	t.Run("zero duration", func(t *testing.T) {
+		err := sleepWithContext(context.Background(), 0)
+		assert.NoError(t, err)
+	})
+
+	t.Run("negative duration", func(t *testing.T) {
+		err := sleepWithContext(context.Background(), -1*time.Second)
+		assert.NoError(t, err)
+	})
+}
+
+// TestDoWithRetriesInner_429Backoff verifies that doWithRetriesInner applies
+// backoff on HTTP 429 responses before retrying, both with and without the
+// Retry-After header.
+func TestDoWithRetriesInner_429Backoff(t *testing.T) {
+	t.Run("respects Retry-After header before retry", func(t *testing.T) {
+		var calls int32
+		start := time.Now()
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := calls
+			calls++
+			if n == 0 {
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusTooManyRequests)
+				io.WriteString(w, "rate limited")
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, "ok")
+		})
+		s := httptest.NewServer(h)
+		defer s.Close()
+
+		u, _ := url.Parse(s.URL)
+		r := &request{
+			method: http.MethodGet,
+			path:   "/test",
+			header: http.Header{},
+			host: RegistryHost{
+				Client: s.Client(),
+				Host:   u.Host,
+				Scheme: u.Scheme,
+			},
+		}
+		attempts := maxAttempts
+		resp, err := r.doWithRetriesInner(context.Background(), nil, &attempts, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resp.Body.Close()
+
+		elapsed := time.Since(start)
+		assert.Equal(t, int32(2), calls, "server should be called twice")
+		assert.GreaterOrEqual(t, elapsed, 1*time.Second, "should wait at least Retry-After=1s")
+	})
+
+	t.Run("exponential backoff when no Retry-After", func(t *testing.T) {
+		var calls int32
+		start := time.Now()
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := calls
+			calls++
+			if n < 2 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				io.WriteString(w, "rate limited")
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, "ok")
+		})
+		s := httptest.NewServer(h)
+		defer s.Close()
+
+		u, _ := url.Parse(s.URL)
+		r := &request{
+			method: http.MethodGet,
+			path:   "/test",
+			header: http.Header{},
+			host: RegistryHost{
+				Client: s.Client(),
+				Host:   u.Host,
+				Scheme: u.Scheme,
+			},
+		}
+		attempts := maxAttempts
+		resp, err := r.doWithRetriesInner(context.Background(), nil, &attempts, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resp.Body.Close()
+
+		elapsed := time.Since(start)
+		assert.Equal(t, int32(3), calls, "server should be called 3 times")
+		// 1s + 2s + jitter => at least ~3s, well under ~4.5s
+		assert.GreaterOrEqual(t, elapsed, 2500*time.Millisecond, "should apply exponential backoff")
+		assert.Less(t, elapsed, 6*time.Second, "should not take unreasonably long")
+	})
+
+	t.Run("context cancel stops backoff", func(t *testing.T) {
+		var calls int32
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, "rate limited")
+		})
+		s := httptest.NewServer(h)
+		defer s.Close()
+
+		u, _ := url.Parse(s.URL)
+		r := &request{
+			method: http.MethodGet,
+			path:   "/test",
+			header: http.Header{},
+			host: RegistryHost{
+				Client: s.Client(),
+				Host:   u.Host,
+				Scheme: u.Scheme,
+			},
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		// Cancel quickly — during the 1s backoff sleep after the first 429.
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+
+		attempts := maxAttempts
+		_, err := r.doWithRetriesInner(ctx, nil, &attempts, true)
+		assert.ErrorIs(t, err, context.Canceled, "should return context.Canceled")
+		assert.Equal(t, int32(1), calls, "server called exactly once before backoff was interrupted")
+	})
+
+	t.Run("429 with Retry-After zero retries immediately", func(t *testing.T) {
+		var calls int32
+		start := time.Now()
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := calls
+			calls++
+			if n == 0 {
+				w.Header().Set("Retry-After", "0")
+				w.WriteHeader(http.StatusTooManyRequests)
+				io.WriteString(w, "rate limited")
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, "ok")
+		})
+		s := httptest.NewServer(h)
+		defer s.Close()
+
+		u, _ := url.Parse(s.URL)
+		r := &request{
+			method: http.MethodGet,
+			path:   "/test",
+			header: http.Header{},
+			host: RegistryHost{
+				Client: s.Client(),
+				Host:   u.Host,
+				Scheme: u.Scheme,
+			},
+		}
+		attempts := maxAttempts
+		resp, err := r.doWithRetriesInner(context.Background(), nil, &attempts, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resp.Body.Close()
+
+		elapsed := time.Since(start)
+		assert.Equal(t, int32(2), calls)
+		assert.Less(t, elapsed, 200*time.Millisecond, "Retry-After=0 should retry immediately")
+	})
+}

@@ -22,11 +22,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -807,10 +809,111 @@ func (r *request) doWithRetriesInner(ctx context.Context, responses []*http.Resp
 		return nil, err
 	}
 	if retry && *attempts > 0 {
+		// Apply backoff for rate-limit (429) responses before retrying.
+		// Immediate retries on 429 are counterproductive — they prolong the
+		// rate-limit window on ECR, GCR, Harbor, etc.
+		lastResp := responses[len(responses)-1]
+		if lastResp.StatusCode == http.StatusTooManyRequests {
+			delay := backoffDuration(http.StatusTooManyRequests, lastResp.Header.Get("Retry-After"), len(responses)-1)
+			resp.Body.Close()
+			if err := sleepWithContext(ctx, delay); err != nil {
+				return nil, err
+			}
+			return r.doWithRetriesInner(ctx, responses, attempts, lastHost)
+		}
 		resp.Body.Close()
 		return r.doWithRetriesInner(ctx, responses, attempts, lastHost)
 	}
 	return resp, err
+}
+
+// backoffDuration returns the duration to wait before retrying a request that
+// received an HTTP error status code. For 429 responses, it first honors the
+// server-provided Retry-After header (if present), otherwise falls back to
+// exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s capped at 32s.
+// For other retryable status codes, it returns a small fixed delay to avoid
+// tight retry loops.
+//
+// attempt is the zero-based retry attempt number (0 for the first retry).
+func backoffDuration(statusCode int, retryAfterHeader string, attempt int) time.Duration {
+	if statusCode == http.StatusTooManyRequests {
+		if d, ok := parseRetryAfterHeader(retryAfterHeader); ok {
+			if d < 0 {
+				d = 0
+			}
+			// Cap server-provided Retry-After to a reasonable maximum.
+			const maxRetryAfter = 60 * time.Second
+			if d > maxRetryAfter {
+				d = maxRetryAfter
+			}
+			return d
+		}
+		// Exponential backoff: base=1s, doubled each attempt, capped at 32s.
+		const base = time.Second
+		const cap = 32 * time.Second
+		d := base
+		for i := 0; i < attempt && d < cap; i++ {
+			d *= 2
+		}
+		if d > cap {
+			d = cap
+		}
+		// Add up to 25% jitter to avoid thundering herd.
+		if d > 0 {
+			jitter := time.Duration(rand.Int63n(int64(d) / 4))
+			d += jitter
+		}
+		return d
+	}
+	// Small delay for other retryable errors (503, 504, 500, 408).
+	return 50 * time.Millisecond
+}
+
+// parseRetryAfterHeader parses an HTTP Retry-After header value per RFC 7231 §7.1.3.
+// It accepts either a number of seconds (e.g. "120") or an HTTP-date
+// (e.g. "Wed, 21 Oct 2015 07:28:00 GMT"). Returns the duration to wait and
+// whether parsing succeeded.
+func parseRetryAfterHeader(value string) (time.Duration, bool) {
+	if value == "" {
+		return 0, false
+	}
+	// Try as seconds first.
+	if secs, err := strconv.Atoi(value); err == nil {
+		return time.Duration(secs) * time.Second, true
+	}
+	// Try as HTTP-date.
+	for _, layout := range []string{
+		time.RFC1123,
+		time.RFC1123Z,
+		"Monday, 02-Jan-06 15:04:05 MST",
+		"Monday, 02-Jan-06 15:04:05 -0700",
+		time.RFC850,
+		"_2 Jan 06 15:04 MST",
+		"_2 Jan 06 15:04 -0700",
+	} {
+		if t, err := time.Parse(layout, value); err == nil {
+			d := time.Until(t)
+			if d < 0 {
+				d = 0
+			}
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+// sleepWithContext pauses for d or until ctx is canceled, whichever comes first.
+// Returns nil if the full duration elapsed, or the context error if canceled.
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 // doWithTransportRetries calls r.do, retrying on transient transport errors
