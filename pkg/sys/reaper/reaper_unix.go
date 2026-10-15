@@ -29,6 +29,7 @@ import (
 	"time"
 
 	runc "github.com/containerd/go-runc"
+	"github.com/containerd/log"
 	"golang.org/x/sys/unix"
 )
 
@@ -63,21 +64,66 @@ func (s *subscriber) do(fn func()) {
 // Reap should be called when the process receives an SIGCHLD.  Reap will reap
 // all exited processes and close their wait channels
 func Reap() error {
-	now := time.Now()
-	exits, err := reap(false)
-	for _, e := range exits {
-		done := Default.notify(runc.Exit{
-			Timestamp: now,
-			Pid:       e.Pid,
-			Status:    e.Status,
-		})
+	return reapWithRetry(2, 50*time.Millisecond)
+}
 
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
+// reapWithRetry performs a non-blocking reap, then retries up to `attempts`
+// times (separated by `interval`) if the first sweep found nothing. This
+// compensates for SIGCHLD merging (standard Linux behaviour for non-realtime
+// signals): when many children exit nearly simultaneously the kernel may
+// coalesce several SIGCHLDs into one delivery, and a single Wait4 sweep
+// can miss stragglers that hadn't quite transitioned to zombie status yet.
+//
+// The function also emits diagnostics so operators can see when the reaper
+// is under unusual load or is unexpectedly emptying.
+func reapWithRetry(attempts int, interval time.Duration) error {
+	logger := log.L.WithField("source", "reaper.Reap")
+
+	var firstErr error
+	var totalExits int
+	var anyFound bool
+
+	for i := 0; i < attempts; i++ {
+		now := time.Now()
+		exits, err := reap(false)
+		if firstErr == nil && err != nil {
+			firstErr = err
+		}
+		if len(exits) > 0 {
+			anyFound = true
+			totalExits += len(exits)
+			for _, e := range exits {
+				done := Default.notify(runc.Exit{
+					Timestamp: now,
+					Pid:       e.Pid,
+					Status:    e.Status,
+				})
+
+				select {
+				case <-done:
+				case <-time.After(1 * time.Second):
+					logger.Warnf(
+						"reaper: timed out publishing exit for pid=%d status=%d — subscriber may be stuck",
+						e.Pid, e.Status,
+					)
+				}
+			}
+		}
+		// If we found exits on this sweep, one more quick follow-up sweep
+		// after a tiny sleep is cheap and guards against partially reaped
+		// batches. If we found nothing on the first attempt, retry to make
+		// sure we didn't race the kernel's zombie bookkeeping.
+		if i < attempts-1 {
+			time.Sleep(interval)
 		}
 	}
-	return err
+
+	if !anyFound {
+		logger.Debug("reaper: no exited children found across retries")
+	} else if totalExits > 1 {
+		logger.Debugf("reaper: reaped %d process(es)", totalExits)
+	}
+	return firstErr
 }
 
 // Default is the default monitor initialized for the package

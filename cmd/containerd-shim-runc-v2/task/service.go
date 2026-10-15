@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/containerd/cgroups/v3"
 	"github.com/containerd/cgroups/v3/cgroup1"
@@ -38,6 +40,7 @@ import (
 	"github.com/containerd/ttrpc"
 	"github.com/containerd/typeurl/v2"
 	"github.com/moby/sys/userns"
+	"golang.org/x/sys/unix"
 
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/process"
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/runc"
@@ -86,6 +89,7 @@ func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.S
 		execCountSubscribers: make(map[*runc.Container]chan<- int),
 		containerInitExit:    make(map[*runc.Container]runcC.Exit),
 		exitSubscribers:      make(map[*map[int][]runcC.Exit]struct{}),
+		initExitEmitted:      make(map[*runc.Container]bool),
 	}
 	go s.processExits()
 	runcC.Monitor = reaper.Default
@@ -93,6 +97,10 @@ func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.S
 		return nil, fmt.Errorf("failed to initialized platform behavior: %w", err)
 	}
 	go s.forward(ctx, publisher)
+	// healthz periodically detects the "PID 1 died but no TaskExit emitted"
+	// leak described in issue #13849 and force-emits the exit event so the
+	// shim can unwind and let the daemon proceed.
+	go s.healthz()
 
 	if address, err := shim.ReadAddress("address"); err == nil {
 		sd.RegisterCallback(func(context.Context) error {
@@ -136,6 +144,12 @@ type service struct {
 	// dereferencing the subscription pointers must only be done while holding
 	// lifecycleMu.
 	exitSubscribers map[*map[int][]runcC.Exit]struct{}
+
+	// initExitEmitted tracks whether the TaskExit event for the container's
+	// init process has already been published. This is guarded by lifecycleMu.
+	// Used by the healthz goroutine to detect the "PID 1 dead but no TaskExit
+	// published" anomaly described in #13849.
+	initExitEmitted map[*runc.Container]bool
 
 	shutdown shutdown.Service
 }
@@ -372,6 +386,7 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 		})
 		s.lifecycleMu.Lock()
 		delete(s.containerInitExit, container)
+		delete(s.initExitEmitted, container)
 		s.lifecycleMu.Unlock()
 	}
 	return &taskAPI.DeleteResponse{
@@ -781,6 +796,12 @@ func (s *service) handleProcessExit(e runcC.Exit, c *runc.Container, p process.P
 				WithError(err).
 				Error("failed to stop oom event watcher")
 		}
+
+		// Record that the init TaskExit event has been published so the
+		// healthz goroutine does not attempt to re-publish it.
+		s.lifecycleMu.Lock()
+		s.initExitEmitted[c] = true
+		s.lifecycleMu.Unlock()
 	}
 	s.send(&eventstypes.TaskExit{
 		ContainerID: c.ID,
@@ -865,4 +886,235 @@ func (s *service) initPlatform() error {
 	s.platform = p
 	s.shutdown.RegisterCallback(func(context.Context) error { return s.platform.Close() })
 	return nil
+}
+
+// healthz is a background goroutine that periodically scans all known
+// containers for the "PID 1 is dead but no TaskExit event has been published"
+// anomaly described in issue #13849.
+//
+// The scenario:
+//  1. Container PID 1 exits before its children / execs.
+//  2. SIGCHLD for PID 1 may be lost (unlikely but possible under heavy load or
+//     signal-storm conditions), OR the reaper picks up PID 1 and calls
+//     SetExited / handleInitExit but then handleInitExit blocks forever
+//     waiting for an exec-count subscriber that never fires because all the
+//     exec processes had already been reaped separately.
+//  3. In either case the shim stays alive, Daemon thinks the container is
+//     still "running", and every daemon API call that waits on the TaskExit
+//     blocks indefinitely.
+//
+// healthz mitigates this by:
+//   - detecting init processes whose status has transitioned to "stopped"
+//     but for which no TaskExit has been published;
+//   - proactively invoking the reaper when an init PID is observed to be
+//     dead via kill(pid, 0) but still reported as "running";
+//   - as a last resort, synthesising a fake runc.Exit and driving the normal
+//     exit-handling path so that the TaskExit event is emitted and the shim
+//     can unwind.
+//
+// The check interval is deliberately conservative — 10s is far faster than
+// a human operator would notice the container is stuck but slow enough to
+// avoid perturbing the hot path under normal load.
+const (
+	healthzInterval       = 10 * time.Second
+	healthzStuckThreshold = 30 * time.Second // 3 consecutive missed ticks before we force-emits
+)
+
+func (s *service) healthz() {
+	var stuckCounters map[*runc.Container]int
+	for {
+		select {
+		case <-s.shutdown.Done():
+			return
+		case <-time.After(healthzInterval):
+		}
+
+		ctx := s.context
+		if ctx == nil {
+			ctx = context.Background()
+		}
+
+		if stuckCounters == nil {
+			stuckCounters = make(map[*runc.Container]int)
+		}
+
+		// Snapshot containers under mu so we don't hold it during the (slow)
+		// per-container work.
+		s.mu.Lock()
+		ids := make([]string, 0, len(s.containers))
+		for id := range s.containers {
+			ids = append(ids, id)
+		}
+		s.mu.Unlock()
+
+		for _, id := range ids {
+			s.mu.Lock()
+			c := s.containers[id]
+			s.mu.Unlock()
+			if c == nil {
+				continue
+			}
+
+			stuck := s.checkContainerAnomaly(ctx, c)
+			if stuck {
+				stuckCounters[c]++
+				if stuckCounters[c] >= int(healthzStuckThreshold/healthzInterval) {
+					log.G(ctx).Warnf(
+						"healthz: container %s init has been stuck without TaskExit for %v — force-emitting exit event",
+						c.ID, time.Duration(stuckCounters[c])*healthzInterval,
+					)
+					s.forceInitExit(ctx, c)
+					delete(stuckCounters, c)
+				}
+			} else {
+				delete(stuckCounters, c)
+			}
+		}
+	}
+}
+
+// checkContainerAnomaly inspects a single container and reports whether it
+// matches the "PID 1 dead but no TaskExit published" anomaly. It also proactively
+// triggers a reaper sweep when SIGCHLD appears to have been missed.
+func (s *service) checkContainerAnomaly(ctx context.Context, c *runc.Container) bool {
+	initProc, err := c.Process("")
+	if err != nil {
+		// Container is in a weird state — let Delete/Create handle it.
+		return false
+	}
+	init, ok := initProc.(*process.Init)
+	if !ok {
+		return false
+	}
+
+	initPid := init.Pid()
+
+	// Fast check #1: TaskExit has already been published for this init.
+	s.lifecycleMu.Lock()
+	if s.initExitEmitted[c] {
+		s.lifecycleMu.Unlock()
+		return false
+	}
+	// If there are still running execs or something is waiting on exec-count
+	// changes, we must NOT force-emit yet — handleInitExit is legitimately
+	// waiting for them to finish.
+	if s.runningExecs[c] > 0 {
+		s.lifecycleMu.Unlock()
+		return false
+	}
+	if _, waiting := s.execCountSubscribers[c]; waiting {
+		s.lifecycleMu.Unlock()
+		return false
+	}
+	// Also check: is the init PID still in the running map? If yes, the normal
+	// path is still tracking it.
+	cps := s.running[initPid]
+	s.lifecycleMu.Unlock()
+
+	if len(cps) > 0 {
+		// init is still registered with the reaper; nothing to do here.
+		return false
+	}
+
+	// Slow check #2: has the init already transitioned to "stopped" in the
+	// process state machine? That means the reaper DID fire and SetExited was
+	// called, but the exit event never made it through.
+	st, err := init.Status(ctx)
+	if err == nil && st == "stopped" {
+		log.G(ctx).Warnf(
+			"healthz: container %s init is stopped but no TaskExit emitted (pid=%d, running entries for pid=%d: 0)",
+			c.ID, initPid, initPid,
+		)
+		return true
+	}
+
+	// Slow check #3: probe the kernel. If kill(pid, 0) returns ESRCH the
+	// process is definitely dead — and since the shim is running as PID 1 of
+	// its own PID namespace (or otherwise has permission to observe it), we
+	// can trigger the reaper ourselves.
+	if initPid > 0 {
+		if err := unix.Kill(initPid, 0); err != nil {
+			if err == unix.ESRCH || err == syscall.ESRCH {
+				// PID is dead and gone. Try to reap any remaining zombies — the
+				// SIGCHLD may have been coalesced or otherwise missed.
+				log.G(ctx).Warnf(
+					"healthz: container %s init pid %d not alive (kill -0 failed: %v) — triggering proactive reaper sweep",
+					c.ID, initPid, err,
+				)
+				if reapErr := reaper.Reap(); reapErr != nil {
+					log.G(ctx).WithError(reapErr).Warn("healthz: proactive reaper sweep returned error")
+				}
+				// After the sweep, if initExitEmitted is still false AND the
+				// init is still not in the running map, the reaper event was
+				// definitively lost — escalate to force-emit.
+				s.lifecycleMu.Lock()
+				emitted := s.initExitEmitted[c]
+				s.lifecycleMu.Unlock()
+				if !emitted {
+					return true
+				}
+				return false
+			}
+			// Some other unexpected error from kill(0); don't assume anything.
+			log.G(ctx).WithError(err).Debugf(
+				"healthz: kill(0) probe for container %s pid %d failed",
+				c.ID, initPid,
+			)
+		}
+	}
+
+	return false
+}
+
+// forceInitExit bypasses the normal reaper-driven path and publishes a
+// TaskExit for the container's init process directly. It is the final line
+// of defence for issue #13849 — the previous healthz checks already tried
+// to trigger the reaper, and after several missed ticks we conclude the
+// exit event is genuinely stuck and synthesise one.
+//
+// The exit status we report is best-effort: prefer the last value we saw
+// in containerInitExit, otherwise 137 (SIGKILL) as a safe "something went
+// wrong" sentinel.
+func (s *service) forceInitExit(ctx context.Context, c *runc.Container) {
+	initProc, err := c.Process("")
+	if err != nil {
+		return
+	}
+	init, ok := initProc.(*process.Init)
+	if !ok {
+		return
+	}
+
+	// Prevent double-publish — another goroutine may have raced us.
+	s.lifecycleMu.Lock()
+	if s.initExitEmitted[c] {
+		s.lifecycleMu.Unlock()
+		return
+	}
+
+	exit := runcC.Exit{
+		Pid:    init.Pid(),
+		Status: 137, // SIGKILL sentinel
+	}
+	if recorded, ok := s.containerInitExit[c]; ok {
+		exit = recorded
+	}
+
+	// If the init still thinks it's running, transition it to stopped so
+	// any concurrent Wait() callers unblock.
+	init.SetExited(exit.Status)
+
+	// Remove from running map so subsequent checks won't re-trigger.
+	s.running[exit.Pid] = nil
+	s.initExitEmitted[c] = true
+	s.lifecycleMu.Unlock()
+
+	log.G(ctx).Warnf(
+		"healthz: synthesising TaskExit for container %s pid %d status %d",
+		c.ID, exit.Pid, exit.Status,
+	)
+
+	// Drive the normal handler path so that the exit status is persisted,
+	// OOM watcher torn down, and TaskExit published.
+	s.handleProcessExit(exit, c, init)
 }
