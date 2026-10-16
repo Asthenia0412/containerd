@@ -544,9 +544,9 @@ func testLCCNoOpWithoutDiffID(t *testing.T, newSnapshotter testsuite.Snapshotter
 	}
 	sn := o.(*testSnapshotter)
 
-	// Bypass testSnapshotter.Prepare to omit LabelSnapshotDiffID, simulating a
+	// Bypass Prepare-with-diffID to omit LabelSnapshotDiffID, simulating a
 	// container-start Prepare that carries no diff-ID.
-	if _, err := sn.snapshotter.Prepare(ctx, "no-diffid", ""); err != nil {
+	if _, err := sn.Prepare(ctx, "no-diffid", ""); err != nil {
 		t.Fatal(err)
 	}
 

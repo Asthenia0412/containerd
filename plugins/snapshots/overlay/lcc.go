@@ -268,22 +268,32 @@ func (lcc *layerContentCache) commitOpts(info snapshots.Info) []snapshots.Opt {
 }
 
 // prepareFSDir sets up the fs/ subdirectory within td. If LabelSkipApply is
-// set, fs/ is created as a relative symlink to the shared cache content path;
-// the symlink is relative so the snapshot tree remains valid if the containerd
-// root is relocated. Otherwise fs/ is created as a regular directory for extraction.
+// set, the pre-existing fs/ directory (created by prepareDirectory) is
+// removed and replaced with a relative symlink to the shared cache content
+// path; the symlink is relative so the snapshot tree remains valid if the
+// containerd root is relocated. Otherwise (cache miss), fs/ is already an
+// empty directory from prepareDirectory — leave it alone for layer extraction.
 func (lcc *layerContentCache) prepareFSDir(info snapshots.Info, td string) error {
+	if info.Labels[snapshots.LabelSkipApply] != "true" {
+		// Cache miss: fs/ was already created as an empty directory by
+		// prepareDirectory. Nothing to do here.
+		return nil
+	}
 	contentPath, err := lcc.contentPath(info)
 	if err != nil {
 		return err
 	}
-	if info.Labels[snapshots.LabelSkipApply] == "true" {
-		relPath, err := filepath.Rel(td, contentPath)
-		if err != nil {
-			return fmt.Errorf("failed to compute relative lcc cache path: %w", err)
-		}
-		return os.Symlink(relPath, filepath.Join(td, "fs"))
+	fsPath := filepath.Join(td, "fs")
+	// Remove the empty directory created by prepareDirectory so we can
+	// replace it with a symlink.
+	if err := os.RemoveAll(fsPath); err != nil {
+		return fmt.Errorf("failed to remove existing fs dir for lcc symlink: %w", err)
 	}
-	return os.Mkdir(filepath.Join(td, "fs"), 0755)
+	relPath, err := filepath.Rel(td, contentPath)
+	if err != nil {
+		return fmt.Errorf("failed to compute relative lcc cache path: %w", err)
+	}
+	return os.Symlink(relPath, fsPath)
 }
 
 // commitFSDir ensures the snapshot's fs/ directory is a symlink to the shared
