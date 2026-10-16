@@ -49,6 +49,7 @@ type SnapshotterConfig struct {
 	mountOptions  []string
 	remapIDs      bool
 	slowChown     bool
+	lccEnabled    bool
 }
 
 // Opt is an option to configure the overlay snapshotter
@@ -114,6 +115,7 @@ type snapshotter struct {
 	options       []string
 	remapIDs      bool
 	slowChown     bool
+	lcc           *layerContentCache
 }
 
 // NewSnapshotter returns a Snapshotter which uses overlayfs. The overlayfs
@@ -165,7 +167,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		config.mountOptions = append(config.mountOptions, "index=off")
 	}
 
-	return &snapshotter{
+	s := &snapshotter{
 		root:          root,
 		ms:            config.ms,
 		asyncRemove:   config.asyncRemove,
@@ -173,7 +175,23 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		options:       config.mountOptions,
 		remapIDs:      config.remapIDs,
 		slowChown:     config.slowChown,
-	}, nil
+	}
+
+	if config.lccEnabled {
+		// Ensure the cache root exists before constructing LCC. orphanedPaths
+		// reads this directory on Cleanup, and commitFSDir's os.Rename target
+		// lives underneath it.
+		if err := os.MkdirAll(filepath.Join(root, "cache"), 0700); err != nil {
+			return nil, fmt.Errorf("failed to create lcc cache root: %w", err)
+		}
+		lcc, err := newLayerContentCache(context.Background(), config.ms, root, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize layer content cache: %w", err)
+		}
+		s.lcc = lcc
+	}
+
+	return s, nil
 }
 
 // hasOption reports whether the "key" option is present in options, either
@@ -301,9 +319,26 @@ func (o *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 func (o *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
 	return o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		// grab the existing id
-		id, _, _, err := storage.GetInfo(ctx, key)
+		id, info, _, err := storage.GetInfo(ctx, key)
 		if err != nil {
 			return err
+		}
+
+		// Layer Content Cache: finalize the fs/ directory before usage
+		// calculation so that DiskUsage sees either the symlink target
+		// (cache hit) or the extracted content (cache miss) consistently.
+		var rollbackLCC func()
+		if o.lcc != nil && hasCacheDir(info) {
+			if err := o.lcc.commitFSDir(id, info); err != nil {
+				return fmt.Errorf("failed to commit lcc fs dir: %w", err)
+			}
+			opts = append(opts, o.lcc.commitOpts(info)...)
+			rollbackLCC = o.lcc.addSnapInfo(name, info.Parent, info.Labels[snapshots.LabelSnapshotDiffID])
+			defer func() {
+				if err != nil && rollbackLCC != nil {
+					rollbackLCC()
+				}
+			}()
 		}
 
 		usage, err := fs.DiskUsage(ctx, o.upperPath(id))
@@ -323,6 +358,7 @@ func (o *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 // be freed up on the next call to `Cleanup`.
 func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	var removals []string
+	var removedName string
 	// Remove directories after the transaction is closed, failures must not
 	// return error since the transaction is committed with the removal
 	// key no longer available.
@@ -333,9 +369,23 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 					log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")
 				}
 			}
+			// Layer Content Cache: drop in-memory entry for the removed snapshot
+			// so future diffIDSeqInChain calls do not count it.
+			if o.lcc != nil && removedName != "" {
+				o.lcc.deleteSnapInfo(removedName)
+			}
 		}
 	}()
 	return o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		// Grab info before removal so we can record the committed name for
+		// LCC snapInfo cleanup after the transaction completes.
+		if o.lcc != nil {
+			_, info, _, err := storage.GetInfo(ctx, key)
+			if err == nil {
+				removedName = info.Name
+			}
+		}
+
 		_, _, err = storage.Remove(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to remove snapshot %s: %w", key, err)
@@ -393,7 +443,22 @@ func (o *snapshotter) cleanupDirectories(ctx context.Context) (_ []string, err e
 	// while the cleanup is scanning.
 	if err := o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		cleanupDirs, err = o.getCleanupDirectories(ctx)
-		return err
+		if err != nil {
+			return err
+		}
+		// Layer Content Cache: collect cache directories that are no longer
+		// referenced by any snapshot (stale entries + prior .orphaned
+		// staging dirs). Renaming within the transaction closes the race
+		// where a Prepare could observe the dir, create a symlink to it,
+		// and then lose the symlink when we RemoveAll outside the tx.
+		if o.lcc != nil {
+			orphaned, err := o.lcc.orphanedPaths(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to collect lcc orphaned paths: %w", err)
+			}
+			cleanupDirs = append(cleanupDirs, orphaned...)
+		}
+		return nil
 	}); err != nil {
 		return nil, err
 	}
@@ -459,6 +524,25 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 			return fmt.Errorf("failed to create prepare snapshot dir: %w", err)
 		}
 
+		// Layer Content Cache: inject LCC labels into opts before CreateSnapshot
+		// so that labels are part of the snapshot metadata from creation time.
+		if o.lcc != nil {
+			var existing snapshots.Info
+			for _, opt := range opts {
+				if err := opt(&existing); err != nil {
+					return fmt.Errorf("failed to apply opts for lcc label extraction: %w", err)
+				}
+			}
+			diffID := existing.Labels[snapshots.LabelSnapshotDiffID]
+			if diffID != "" {
+				lccLabels, err := o.lcc.computeLabels(parent, diffID, -1, -1)
+				if err != nil {
+					return fmt.Errorf("failed to compute lcc labels: %w", err)
+				}
+				opts = append(opts, snapshots.WithLabels(lccLabels))
+			}
+		}
+
 		s, err = storage.CreateSnapshot(ctx, kind, key, parent, opts...)
 		if err != nil {
 			return fmt.Errorf("failed to create snapshot: %w", err)
@@ -467,6 +551,16 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		_, info, _, err = storage.GetInfo(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to get snapshot info: %w", err)
+		}
+
+		// Layer Content Cache: if this snapshot participates in LCC, prepare
+		// the fs/ directory now — either create a symlink to the shared
+		// cache content (cache hit, LabelSkipApply set) or keep the empty
+		// directory for layer extraction (cache miss).
+		if o.lcc != nil && hasDiffID(info) {
+			if err := o.lcc.prepareFSDir(info, td); err != nil {
+				return fmt.Errorf("failed to prepare lcc fs dir: %w", err)
+			}
 		}
 
 		var (

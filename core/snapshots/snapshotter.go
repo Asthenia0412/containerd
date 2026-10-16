@@ -59,6 +59,16 @@ const (
 	// pick a snapshotter that supports it.
 	LabelSnapshotMaxSize = "containerd.io/snapshot/max-size"
 
+	// LabelSkipApply is set by the snapshotter on a Prepare call when the
+	// snapshot's content is already present in a shared cache directory
+	// and the caller (typically the unpacker) should skip the fetch/apply
+	// step. When set to "true", the snapshot's fs/ directory is a symlink
+	// to the cached content; the caller must not attempt to write into it.
+	// The snapshotter still expects Commit to be called, which finalizes
+	// the symlink and records metadata. It is inherited by
+	// FilterInheritedLabels.
+	LabelSkipApply = "containerd.io/snapshot/skip-apply"
+
 	// RebaseCap is a snapshotter capability (advertised via the plugin's metadata)
 	// indicating that an active snapshot may be committed with a parent supplied at
 	// Commit time (via WithParent). It lets the unpacker prepare and apply layers in
