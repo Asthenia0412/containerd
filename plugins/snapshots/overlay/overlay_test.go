@@ -48,6 +48,10 @@ func newSnapshotterWithOpts(opts ...Opt) testsuite.SnapshotterFunc {
 	}
 }
 
+// testSnapshotter is a type alias for the concrete snapshotter used in LCC
+// unit tests so that tests can access unexported fields via type assertions.
+type testSnapshotter = snapshotter
+
 // NewSnapshotter must not auto-append "index=off" when the configuration
 // already carries an index option: mount options are last-wins in the
 // kernel, so the appended "index=off" would silently override a configured

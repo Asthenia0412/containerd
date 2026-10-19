@@ -121,6 +121,19 @@ func applyLayers(ctx context.Context, layers []Layer, chain []digest.Digest, sn 
 		err     error
 	)
 
+	// Inject the layer's diff-ID so that snapshotters can participate in
+	// content-level caching (e.g. the overlay snapshotter's Layer Content
+	// Cache). Snapshotters use this label to decide whether to serve the
+	// layer from a shared cache (LabelSkipApply set) or create a fresh
+	// extraction directory.
+	snapshotLabels := map[string]string{
+		snapshots.LabelSnapshotDiffID: layer.Diff.Digest.String(),
+	}
+	// Clone opts before appending: callers may reuse the slice across calls,
+	// and we must not mutate their backing array.
+	opts = append([]snapshots.Opt{}, opts...)
+	opts = append(opts, snapshots.WithLabels(snapshotLabels))
+
 	for {
 		key = fmt.Sprintf(snapshots.UnpackKeyFormat, uniquePart(), chainID)
 
@@ -159,14 +172,27 @@ func applyLayers(ctx context.Context, layers []Layer, chain []digest.Digest, sn 
 		}
 	}()
 
-	diff, err = a.Apply(ctx, layer.Blob, mounts, applyOpts...)
-	if err != nil {
-		err = fmt.Errorf("failed to extract layer %s: %w", layer.Diff.Digest, err)
-		return err
+	// Check whether the snapshotter staged the layer content (e.g. an LCC
+	// cache hit). LabelSkipApply being set means the caller must skip
+	// fetch/apply and just Commit — the snapshot's fs/ already points at
+	// the cached content.
+	var staged bool
+	if info, statErr := sn.Stat(ctx, key); statErr == nil {
+		if info.Labels[snapshots.LabelSkipApply] == "true" {
+			staged = true
+		}
 	}
-	if diff.Digest != layer.Diff.Digest {
-		err = fmt.Errorf("wrong diff id calculated on extraction %q", diff.Digest)
-		return err
+
+	if !staged {
+		diff, err = a.Apply(ctx, layer.Blob, mounts, applyOpts...)
+		if err != nil {
+			err = fmt.Errorf("failed to extract layer %s: %w", layer.Diff.Digest, err)
+			return err
+		}
+		if diff.Digest != layer.Diff.Digest {
+			err = fmt.Errorf("wrong diff id calculated on extraction %q", diff.Digest)
+			return err
+		}
 	}
 
 	if err = sn.Commit(ctx, chainID.String(), key, opts...); err != nil {
