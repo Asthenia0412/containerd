@@ -401,7 +401,13 @@ func (lcc *layerContentCache) orphanedPaths(ctx context.Context) ([]string, erro
 		// Rename within the transaction so that any Prepare starting after
 		// this transaction commits will see the path absent and take a cache miss.
 		staged := lcc.orphanedContentPath(path)
-		if err := os.Rename(path, staged); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Rename(path, staged); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// Already gone — a concurrent cleanup collected it between
+				// our ReadDir and this Rename. Skip; the staged path does
+				// not actually exist, so we must not add it to orphaned.
+				continue
+			}
 			return nil, fmt.Errorf("failed to stage orphaned lcc cache dir %s: %w", path, err)
 		}
 		orphaned = append(orphaned, staged)

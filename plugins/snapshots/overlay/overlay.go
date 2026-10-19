@@ -378,10 +378,12 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	}()
 	return o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		// Grab info before removal so we can record the committed name for
-		// LCC snapInfo cleanup after the transaction completes.
+		// LCC snapInfo cleanup after the transaction completes. Use a distinct
+		// variable name so we do not shadow the outer Remove error that the
+		// follow-up storage.Remove call overwrites.
 		if o.lcc != nil {
-			_, info, _, err := storage.GetInfo(ctx, key)
-			if err == nil {
+			_, info, _, lccErr := storage.GetInfo(ctx, key)
+			if lccErr == nil {
 				removedName = info.Name
 			}
 		}
@@ -452,9 +454,9 @@ func (o *snapshotter) cleanupDirectories(ctx context.Context) (_ []string, err e
 		// where a Prepare could observe the dir, create a symlink to it,
 		// and then lose the symlink when we RemoveAll outside the tx.
 		if o.lcc != nil {
-			orphaned, err := o.lcc.orphanedPaths(ctx)
-			if err != nil {
-				return fmt.Errorf("failed to collect lcc orphaned paths: %w", err)
+			orphaned, lccErr := o.lcc.orphanedPaths(ctx)
+			if lccErr != nil {
+				return fmt.Errorf("failed to collect lcc orphaned paths: %w", lccErr)
 			}
 			cleanupDirs = append(cleanupDirs, orphaned...)
 		}
@@ -539,6 +541,9 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 				if err != nil {
 					return fmt.Errorf("failed to compute lcc labels: %w", err)
 				}
+				// Clone opts before appending: callers may reuse the slice
+				// across calls, and we must not mutate their backing array.
+				opts = append([]snapshots.Opt{}, opts...)
 				opts = append(opts, snapshots.WithLabels(lccLabels))
 			}
 		}
